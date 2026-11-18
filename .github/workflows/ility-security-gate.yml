@@ -1,0 +1,179 @@
+# ILITY security gate (managed by the security team - do not edit per repo; changes go through security review).
+# Blocks a PR on: (1) any secret in the PR commits (gitleaks), (2) NEW semgrep ERROR findings vs the base branch,
+# (3) AI security review verdict "block" (Amazon Bedrock in ILITY's AWS account via OIDC; no long-lived keys).
+# Reports only (does not block): dependency CVEs / Dockerfile & IaC misconfig (trivy).
+# Tool versions and action commits are pinned; downloaded binaries are checked against fixed SHA-256 values.
+name: ility-security-gate
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ility-security-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  TRIVY_VERSION: "0.76.2"
+  TRIVY_SHA256: "bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf"
+  SEMGREP_VERSION: "1.185.0"
+
+jobs:
+  scan:
+    name: secrets + SAST + dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned scanners
+        run: |
+          set -euo pipefail
+          cd /tmp
+          curl -sSfL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum -c -
+          curl -sSfL -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          sudo tar -xzf gitleaks.tgz -C /usr/local/bin gitleaks
+          sudo tar -xzf trivy.tgz -C /usr/local/bin trivy
+          pipx install --quiet "semgrep==${SEMGREP_VERSION}"
+          gitleaks version; trivy --version | head -1; semgrep --version
+
+      - name: Resolve scan range
+        id: range
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            # fetch-depth: 0 already brings every remote branch; private repos cannot re-fetch without persisted credentials
+            base=$(git merge-base "origin/$BASE_REF" HEAD)
+          elif [ -n "${BEFORE:-}" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+            base=$BEFORE
+          else
+            base=$(git rev-list --max-parents=0 HEAD | tail -1)
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "Scan range: $base..HEAD" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Gate 1: secrets (gitleaks)"
+        env:
+          BASE: ${{ steps.range.outputs.base }}
+        run: |
+          set -uo pipefail
+          mkdir -p reports
+          if gitleaks git . --redact --no-banner --log-opts="$BASE..HEAD" --report-format json --report-path reports/gitleaks.json; then
+            echo "### gitleaks: no secrets in this change" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### gitleaks: SECRET FOUND - remove it, rotate the credential, and rewrite the commit" >> "$GITHUB_STEP_SUMMARY"
+            python3 -c 'import json;[print(f"- {f[\"RuleID\"]} in {f[\"File\"]}:{f[\"StartLine\"]} (commit {f[\"Commit\"][:8]})") for f in json.load(open("reports/gitleaks.json"))]' >> "$GITHUB_STEP_SUMMARY" || true
+            exit 1
+          fi
+
+      - name: "Gate 2: new SAST findings (semgrep, ERROR only, vs base)"
+        if: always()
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ steps.range.outputs.base }}
+        run: |
+          set -uo pipefail
+          CONFIGS="--config p/security-audit --config p/secrets --config p/javascript --config p/typescript --config p/python --config p/smart-contracts"
+          if [ "$EVENT" = pull_request ]; then
+            rc=0; semgrep scan $CONFIGS --baseline-commit "$BASE" --severity ERROR --error --metrics=off --json -o reports/semgrep.json . || rc=$?
+          else
+            semgrep scan $CONFIGS --severity ERROR --metrics=off --json -o reports/semgrep.json . || true; rc=0
+          fi
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY" || true
+          import json
+          r = json.load(open("reports/semgrep.json")).get("results", [])
+          print(f"### semgrep: {len(r)} ERROR finding(s)" + (" introduced by this PR" if r else ""))
+          for x in r[:50]:
+              print(f"- `{x['check_id'].split('.')[-1]}` {x['path']}:{x['start']['line']} - {x['extra']['message'][:160]}")
+          PY
+          exit $rc
+
+      - name: "Report: dependencies / misconfig (trivy, not blocking)"
+        if: always()
+        run: |
+          set -uo pipefail
+          trivy fs --quiet --scanners vuln,misconfig --severity HIGH,CRITICAL --ignore-unfixed --format json -o reports/trivy.json . || true
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY" || true
+          import json, collections
+          d = json.load(open("reports/trivy.json"))
+          c = collections.Counter(); rows = []
+          for res in d.get("Results", []) or []:
+              for v in res.get("Vulnerabilities", []) or []:
+                  c[v["Severity"]] += 1
+                  if v["Severity"] == "CRITICAL" and len(rows) < 20:
+                      rows.append(f"- {v['PkgName']} {v['InstalledVersion']} -> {v.get('FixedVersion','?')} ({v['VulnerabilityID']}) in {res['Target']}")
+              for m in res.get("Misconfigurations", []) or []:
+                  c["misconfig-" + m["Severity"]] += 1
+          print("### trivy (report only): " + (", ".join(f"{k}={v}" for k, v in sorted(c.items())) or "nothing HIGH/CRITICAL with a fix"))
+          print("\n".join(rows))
+          PY
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: security-reports
+          path: reports/
+          retention-days: 30
+
+  ai-review:
+    name: AI security review (Bedrock)
+    # Only for PRs from branches of this repo: fork PRs never receive AWS credentials.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::202512445136:role/ility-gha-security-review
+          aws-region: ap-southeast-1
+          role-session-name: gha-${{ github.run_id }}
+
+      - name: "Gate 3: AI review of the diff"
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          AI_REVIEW_MODEL: global.anthropic.claude-sonnet-5-5
+          REPORT_BUCKET: ility-security-audit-202512445136-ap-southeast-1
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          mkdir -p reports
+          git diff "origin/$BASE_REF"...HEAD -- . ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)pnpm-lock.yaml' ':(exclude)yarn.lock' | head -c 180000 > reports/diff.patch
+          aws s3 cp "s3://$REPORT_BUCKET/devsecops/gate/ai_review.py" /tmp/ai_review.py --only-show-errors
+          python3 -m venv /tmp/aiv && /tmp/aiv/bin/pip install --quiet --disable-pip-version-check "boto3>=1.35,<2"
+          rc=0; /tmp/aiv/bin/python /tmp/ai_review.py reports/diff.patch reports/ai_review.json || rc=$?
+          aws s3 cp reports/ai_review.json "s3://$REPORT_BUCKET/devsecops/gha/$REPO/$RUN_ID/ai_review.json" --only-show-errors || true
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY" || true
+          import json
+          d = json.load(open("reports/ai_review.json"))
+          print(f"### AI security review: **{d.get('verdict','?')}**")
+          for f in d.get("findings", [])[:30]:
+              print(f"- [{f.get('severity')}] {f.get('file')}:{f.get('line')} - {f.get('issue')} -> fix: {f.get('fix')}")
+          PY
+          verdict=$(python3 -c 'import json;print(json.load(open("reports/ai_review.json")).get("verdict",""))' 2>/dev/null || echo "")
+          if [ "$verdict" = block ]; then echo "::error::AI review verdict: block"; exit 1; fi
+          if [ -z "$verdict" ]; then echo "::warning::AI review did not produce a verdict (rc=$rc); check the job log"; fi
+          exit 0
